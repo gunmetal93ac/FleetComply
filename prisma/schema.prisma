@@ -1,0 +1,481 @@
+// FleetComply — Phase 1 schema.
+// Every tenant-owned table carries orgId and is accessed through
+// src/lib/tenant/repository.ts, which injects orgId into every query.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  SAFETY_MANAGER
+  HR
+  DISPATCH
+  VIEWER
+}
+
+enum DriverStatus {
+  APPLICANT
+  ACTIVE
+  INACTIVE
+  TERMINATED
+}
+
+enum RunStatus {
+  ACTIVE
+  APPROVED
+  CLOSED
+}
+
+enum ItemStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  PENDING_VERIFICATION
+  COMPLETED
+  NOT_APPLICABLE
+  BLOCKED
+}
+
+model Organization {
+  id                           String   @id @default(cuid())
+  name                         String
+  usdotNumber                  String?
+  baseState                    String?
+  preEmploymentAlcoholTesting  Boolean  @default(false)
+  /// true for the clearly labeled demo company created by the seed script
+  isSample                     Boolean  @default(false)
+  createdAt                    DateTime @default(now())
+
+  users     User[]
+  drivers   Driver[]
+  runs      WorkflowRun[]
+  items     ChecklistItem[]
+  events    ItemEvent[]
+  documents Document[]
+  auditLogs AuditLog[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  orgId        String
+  org          Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  email        String   @unique
+  name         String
+  role         Role
+  passwordHash String
+  mfaEnabled   Boolean  @default(false)
+  /// base32 TOTP secret. Encrypt at the column level in production (see ARCHITECTURE.md §Security).
+  mfaSecret    String?
+  disabled     Boolean  @default(false)
+  /// FleetComply operator (not a customer role): may access Regulatory Intelligence and, in later
+  /// stages, approve changes to the shared compliance library. Granted only by scripts/grant-platform-admin.ts.
+  platformAdmin Boolean @default(false)
+  createdAt    DateTime @default(now())
+
+  sessions Session[]
+
+  @@index([orgId])
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// SHA-256 of the cookie token; the raw token is never stored
+  tokenHash  String   @unique
+  mfaPending Boolean  @default(false)
+  expiresAt  DateTime
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Driver {
+  id               String       @id @default(cuid())
+  orgId            String
+  org              Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  firstName        String
+  lastName         String
+  email            String?
+  phone            String?
+  status           DriverStatus @default(APPLICANT)
+  cdlState         String?
+  cdlClass         String?
+  endorsements     String[]     @default([])
+  /// Only the last 4 characters of the license number are stored.
+  cdlNumberLast4   String?
+  cdlExpiresOn     DateTime?
+  medCertExpiresOn DateTime?
+  hireDate         DateTime?
+  isSample         Boolean      @default(false)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  runs      WorkflowRun[]
+  documents Document[]
+
+  @@index([orgId])
+  @@index([orgId, medCertExpiresOn])
+  @@index([orgId, cdlExpiresOn])
+}
+
+model WorkflowRun {
+  id             String       @id @default(cuid())
+  orgId          String
+  org            Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  workflowKey    String
+  title          String
+  driverId       String?
+  driver         Driver?      @relation(fields: [driverId], references: [id])
+  /// Raw questionnaire answers as entered
+  answers        Json
+  /// Facts the engine evaluated (answers + derived facts + org settings)
+  facts          Json
+  warnings       Json
+  catalogVersion String
+  status         RunStatus    @default(ACTIVE)
+  createdById    String
+  approvedById   String?
+  approvedAt     DateTime?
+  approvalNote   String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  items     ChecklistItem[]
+  documents Document[]
+
+  @@index([orgId, status])
+}
+
+model ChecklistItem {
+  id                    String       @id @default(cuid())
+  orgId                 String
+  org                   Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  runId                 String
+  run                   WorkflowRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+  ruleId                String
+  ruleVersion           Int
+  /// Immutable copy of the rule as evaluated — regulatory updates never rewrite it
+  ruleSnapshot          Json
+  stage                 String
+  title                 String
+  classification        String
+  reasons               Json
+  blocksSafetySensitive Boolean
+  status                ItemStatus   @default(NOT_STARTED)
+  sortOrder             Int
+  dueAt                 DateTime?
+  assigneeId            String?
+  notes                 String?
+  completionDate        String?
+  completedById         String?
+  verifiedById          String?
+  verifiedAt            DateTime?
+  naReason              String?
+  blockedReason         String?
+  overrideFlag          Boolean      @default(false)
+  updatedAt             DateTime     @updatedAt
+
+  events    ItemEvent[]
+  documents Document[]
+
+  @@index([orgId, runId])
+  @@index([orgId, status, dueAt])
+}
+
+/// Append-only, timestamped change history for checklist items.
+model ItemEvent {
+  id         String        @id @default(cuid())
+  orgId      String
+  org        Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  itemId     String
+  item       ChecklistItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  actorId    String
+  kind       String // STATUS | ASSIGN | NOTE | DEADLINE | DOCUMENT
+  fromStatus ItemStatus?
+  toStatus   ItemStatus?
+  note       String?
+  data       Json?
+  at         DateTime      @default(now())
+
+  @@index([orgId, itemId, at])
+}
+
+model Document {
+  id             String         @id @default(cuid())
+  orgId          String
+  org            Organization   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  driverId       String?
+  driver         Driver?        @relation(fields: [driverId], references: [id])
+  runId          String?
+  run            WorkflowRun?   @relation(fields: [runId], references: [id])
+  itemId         String?
+  item           ChecklistItem? @relation(fields: [itemId], references: [id])
+  /// Mirrors the rule's recordCategory so DQ, investigation-history, D&A and HR records stay separate
+  recordCategory String
+  filename       String
+  contentType    String
+  size           Int
+  sha256         String
+  storageKey     String         @unique
+  version        Int            @default(1)
+  supersedesId   String?
+  expiresOn      DateTime?
+  retainUntil    DateTime?
+  uploadedById   String
+  createdAt      DateTime       @default(now())
+  deletedAt      DateTime?
+
+  @@index([orgId, driverId])
+  @@index([orgId, itemId])
+}
+
+model AuditLog {
+  id         String       @id @default(cuid())
+  orgId      String
+  org        Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  meta       Json?
+  ip         String?
+  at         DateTime     @default(now())
+
+  @@index([orgId, at])
+}
+
+/// Global (not tenant) — published rule versions, synced from the reviewed code catalog by the seed script.
+model RuleVersion {
+  id                 String   @id @default(cuid())
+  ruleId             String
+  version            Int
+  snapshot           Json
+  verificationStatus String
+  lastVerified       String?
+  catalogVersion     String
+  publishedAt        DateTime @default(now())
+  /// CATALOG = synced from the code catalog. CORRECTION = a human-reviewed correction an administrator published.
+  origin             String   @default("CATALOG")
+  /// The RuleReview that approved a published correction.
+  reviewId           String?
+  publishedById      String?
+
+  @@unique([ruleId, version])
+}
+
+// ───────────────────────── Regulatory Intelligence (global, not tenant) ─────────────────────────
+// Stage 1 (foundation): sources, monitored provisions, the rule → provision dependency map,
+// monitoring run log, human review records, and the detected-change queue.
+// Nothing here publishes or modifies compliance content. Later stages add AI assessments,
+// proposed revisions and notifications in their own migrations.
+
+/// An official source the monitor checks (eCFR, Federal Register, FMCSA, DOT).
+model RegulatorySource {
+  id            String    @id @default(cuid())
+  key           String    @unique // ECFR | FEDERAL_REGISTER | FMCSA | DOT
+  name          String
+  kind          String // API | WEBSITE
+  baseUrl       String
+  enabled       Boolean   @default(true)
+  lastSuccessAt DateTime?
+  lastFailureAt DateTime?
+  /// Run lock: a monitoring run holds the source until this time. Prevents overlapping runs; expires on its own if a run dies.
+  lockedUntil   DateTime?
+  createdAt     DateTime  @default(now())
+
+  runs    MonitorRun[]
+  changes RegulatoryChange[]
+}
+
+/// One CFR section the compliance library depends on. Unique per title + section.
+model RegulatoryProvision {
+  id            String    @id @default(cuid())
+  title         Int // CFR title, e.g. 49
+  part          String // "391"
+  section       String // "391.23"
+  heading       String?
+  sourceUrl     String
+  monitored     Boolean   @default(true)
+  /// Last time a monitoring run successfully fetched this provision (null = never checked).
+  lastCheckedAt DateTime?
+  lastChangedAt DateTime?
+  createdAt     DateTime  @default(now())
+
+  versions ProvisionVersion[]
+  refs     RuleProvisionRef[]
+  changes  RegulatoryChange[]
+
+  @@unique([title, section])
+  @@index([part])
+}
+
+/// A stored copy of a provision's text as fetched from the official source (filled from Stage 2).
+model ProvisionVersion {
+  id          String              @id @default(cuid())
+  provisionId String
+  provision   RegulatoryProvision @relation(fields: [provisionId], references: [id], onDelete: Cascade)
+  /// Source's own version reference, e.g. the eCFR issue date.
+  versionRef  String
+  contentHash String
+  text        String
+  sourceUrl   String
+  fetchedAt   DateTime            @default(now())
+
+  @@unique([provisionId, contentHash])
+  @@index([provisionId, fetchedAt])
+}
+
+/// Dependency map: which workflow step (rule) relies on which provision, down to paragraphs where the
+/// citation names them. Rebuilt from the rule catalog by `npm run reg:sync`.
+model RuleProvisionRef {
+  id           String              @id @default(cuid())
+  ruleId       String
+  provisionId  String
+  provision    RegulatoryProvision @relation(fields: [provisionId], references: [id], onDelete: Cascade)
+  /// Paragraph paths named in the citation, e.g. ["(d)(3)(ii)", "(a)..(c)"]. Empty = whole section.
+  paragraphs   String[]            @default([])
+  citationText String
+  sourceUrl    String
+  /// CATALOG = the step's own citation links to this section. COVERAGE = an administrator added the section to monitoring
+  /// because the step cites a range, subpart or part that includes it (or a proposed correction cites it).
+  origin       String              @default("CATALOG")
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @default(now()) @updatedAt
+
+  @@unique([ruleId, provisionId])
+  @@index([provisionId])
+}
+
+/// Audit log of every monitoring run. A failed run is recorded, never treated as "no changes".
+model MonitorRun {
+  id                String            @id @default(cuid())
+  sourceId          String?
+  source            RegulatorySource? @relation(fields: [sourceId], references: [id])
+  trigger           String // MANUAL | SCHEDULED
+  status            String // RUNNING | SUCCEEDED | PARTIAL | FAILED
+  attempt           Int               @default(1)
+  startedAt         DateTime          @default(now())
+  finishedAt        DateTime?
+  provisionsChecked Int               @default(0)
+  changesDetected   Int               @default(0)
+  error             String?
+  details           Json?
+  triggeredById     String?
+
+  @@index([startedAt])
+  @@index([status, startedAt])
+}
+
+/// A documented HUMAN review of one rule version against its sources. A rule is only described as
+/// human-reviewed when a row exists here — a monitoring run or an automated check never creates one.
+model RuleReview {
+  id          String   @id @default(cuid())
+  ruleId      String
+  ruleVersion Int
+  reviewerId  String
+  reviewedAt  DateTime @default(now())
+  outcome     String // CONFIRMED | NEEDS_CHANGE
+  note        String?
+  /// Source links the reviewer relied on.
+  sources     Json
+  /// The statement shown to users at the time of the review (title, actions, citations…).
+  claim             Json?
+  /// Wording before and after, when the decision concerns a correction.
+  previousWording   Json?
+  updatedWording    Json?
+  /// Source-check evidence the reviewer had in front of them (sections, links, retrieval dates, findings).
+  evidence          Json?
+  /// Regulatory version the evidence was read at, e.g. the eCFR issue date.
+  regulatoryVersion String?
+
+  @@index([ruleId, reviewedAt])
+}
+
+/// Current content-verification state of one workflow step (rule). One row per rule, created the first
+/// time an administrator acts on it. The history is in RuleReview (append-only) and AuditLog.
+/// This is about whether the GUIDANCE has been reviewed — never about whether a customer qualifies.
+model RuleVerification {
+  id                 String    @id @default(cuid())
+  ruleId             String    @unique
+  /// NOT_REVIEWED | REVIEW_REQUIRED | SOURCE_CHECKED | CORRECTION_REQUESTED | APPROVED_AWAITING_PUBLICATION | REVIEWED_PUBLISHED | REVERIFICATION_REQUIRED
+  status             String    @default("NOT_REVIEWED")
+  assigneeId         String?
+  lastSourceCheckAt  DateTime?
+  /// Latest official-source check: sections retrieved, excerpts, dates, deterministic findings. Evidence only.
+  sourceCheck        Json?
+  /// Draft replacement wording and citations. Not shown to customers until approved AND published.
+  proposedCorrection Json?
+  proposedBy         String?
+  proposedAt         DateTime?
+  approvedReviewId   String?
+  publishedVersion   Int?
+  publishedAt        DateTime?
+  /// The detected regulatory change that triggered renewed review.
+  reverifyChangeId   String?
+  /// Set when an administrator rejects the current guidance as incorrect; cleared on publication.
+  rejectedAt         DateTime?
+  /// Administrator dispositions of deterministic findings, keyed by finding key; each key holds its full history.
+  findingReviews     Json?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @default(now()) @updatedAt
+
+  @@index([status])
+}
+
+/// Queue of detected regulatory changes awaiting human review. Created empty in Phase 1; extended in
+/// Regulatory Intelligence Stage 1. Rows are written by the monitor from Stage 2.
+model RegulatoryChange {
+  id          String    @id @default(cuid())
+  ruleId      String?
+  source      String
+  sourceUrl   String
+  summary     String
+  detectedAt  DateTime  @default(now())
+  /// DETECTED | ANALYZING | AWAITING_REVIEW | APPROVED | REJECTED | PUBLISHED | NEEDS_INVESTIGATION | DISMISSED
+  status      String    @default("DETECTED")
+  reviewerId  String?
+  reviewedAt  DateTime?
+  reviewNote  String?
+
+  sourceId    String?
+  sourceRef   RegulatorySource?    @relation(fields: [sourceId], references: [id])
+  provisionId String?
+  provision   RegulatoryProvision? @relation(fields: [provisionId], references: [id])
+  /// The source's own identifier (e.g. Federal Register document number). With `source`, prevents duplicate alerts.
+  externalId  String?
+  agency      String?
+  title       String?
+  citation    String?
+  /// FINAL_RULE | PROPOSED_RULE | INTERIM_FINAL_RULE | CORRECTION | DELAY | STAY | WITHDRAWAL | NOTICE | EXEMPTION | TEXT_CHANGE
+  actionType  String?
+  /// PROPOSED | FINAL_NOT_YET_EFFECTIVE | EFFECTIVE | STAYED | WITHDRAWN | GUIDANCE | UNKNOWN — a proposal is never treated as binding.
+  legalStatus String    @default("UNKNOWN")
+  publicationDate DateTime?
+  effectiveDate   DateTime?
+  complianceDate  DateTime?
+  previousVersionId String?
+  newVersionId      String?
+  /// LOW | NORMAL | HIGH | URGENT
+  priority    String    @default("NORMAL")
+  /// UNVERIFIED | SOURCE_CONFIRMED — whether the source facts were re-fetched and confirmed
+  sourceVerification String @default("UNVERIFIED")
+  /// CFR parts (Title 49) the publication references. Federal Register references stop at the part, so this is the finest match available for those documents.
+  cfrParts    String[]  @default([])
+  /// Source facts exactly as received (action line, dates text, agencies, how parts were determined) — enough to audit and reproduce the record.
+  details     Json?
+  updatedAt   DateTime  @default(now()) @updatedAt
+
+  @@unique([source, externalId])
+  @@index([status, detectedAt])
+  @@index([provisionId])
+  @@index([effectiveDate])
+}
